@@ -290,9 +290,6 @@ func main() {
 	// Setup done signal for the event that either of our consumers die.
 	done := make(chan struct{})
 
-	// Setup a timer so we don't spam log entries about queue length too badly.
-	t := time.Tick(250 * time.Millisecond)
-
 	// Setup a timer for post-record length.
 	after := time.NewTimer(0)
 	after.Stop()
@@ -407,13 +404,6 @@ func main() {
 
 			// Release the recording lock so we can resume discarding old packets.
 			<-record
-		case <-t:
-			// Once ffmpeg has begun producing data.
-			if ffmpegReady.Load() != nil {
-				// Let the user know how deep the queue is. This will only
-				// happen every 250ms.
-				log.Println("Queue Depth:", pktQueue.Len())
-			}
 		}
 	}
 }
