@@ -22,3 +22,11 @@ _testmain.go
 *.exe
 *.test
 *.prof
+
+# Videos and subtitles
+*.mp4
+*.ts
+*.srt
+
+*.fifo
+
