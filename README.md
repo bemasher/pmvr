@@ -20,6 +20,11 @@ go install -v github.com/bemasher/pmvr
 pmvr
 ```
 
+# Resource Usage
+Except for determining magnitude of motion over each frame, we're just shuffling data around. PMVR is very light on resources:
+
+![PMVR Running on an RPi3 with NOIR Camera V1](https://raw.githubusercontent.com/bemasher/pmvr/master/assets/resource_usage.png)
+
 # Improvements and Feature Requests
 Have any improvements or feature requests? Submit an issue and we'll discuss feasibility.
 
