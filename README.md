@@ -21,7 +21,7 @@ pmvr
 ```
 
 # Improvements and Feature Requests
-  * Have any improvements or feature requests? Submit an issue and we'll discuss feasibility.
+Have any improvements or feature requests? Submit an issue and we'll discuss feasibility.
 
 # ToDo
 - [ ] Add command line flags for:
