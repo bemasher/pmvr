@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"runtime/pprof"
 	"strconv"
 	"sync"
 	"time"
@@ -187,7 +186,6 @@ func ConsumeFFmpeg(r io.Reader, pktQueue *PacketQueue, record, done chan struct{
 		// Read the packet.
 		for scanner.Scan() {
 			nal := scanner.Bytes()
-			log.Printf("NAL: %d % 10d % 10d\n", nal[4]&0x1F, len(pkt.Payload), cap(pkt.Payload))
 
 			if nal[4]&0x1F == 7 && len(pkt.Payload) > 0 {
 				lastNal = nal
@@ -241,15 +239,6 @@ func init() {
 }
 
 func main() {
-	pprofFile, err := os.Create("pprof.cpu")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer pprofFile.Close()
-
-	pprof.StartCPUProfile(pprofFile)
-	defer pprof.StopCPUProfile()
-
 	// Setup signal notification, so we can exit gracefully.
 	sig := make(chan os.Signal)
 	signal.Notify(sig, os.Interrupt, os.Kill)
