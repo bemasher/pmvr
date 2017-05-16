@@ -1,19 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"container/list"
-	"encoding/binary"
-	"fmt"
 	"io"
 	"log"
 	"math"
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/pprof"
 	"strconv"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -43,14 +42,8 @@ const (
 	fileTimeFmt    = "2006-01-02T15.04.05.000"
 )
 
-// Motion vectors consist of X and Y vectors and a Sum of Absolute Differences.
-type MotionVector struct {
-	X, Y int8
-	SAD  uint16
-}
-
 // A motion frame is an array of motion vectors.
-type MotionFrame []MotionVector
+type MotionFrame []byte
 
 // Reterns a new motion frame for the given video width and height.
 func NewMotionFrame(w, h int) MotionFrame {
@@ -58,22 +51,22 @@ func NewMotionFrame(w, h int) MotionFrame {
 	mw := (vw+15)>>4 + 1 // Always one extra column.
 	mh := (vh + 15) >> 4
 
-	return make([]MotionVector, mw*mh)
+	return make([]byte, (mw*mh)<<2)
 }
 
 // Determine the magnitude of the motion for all of the vectors.
 func (mv MotionFrame) Mag() (mag float64) {
 	mag = 1.0
-	for _, vec := range mv {
-		abs := int(vec.X) * int(vec.X)
-		abs += int(vec.Y) * int(vec.Y)
+	for idx := 0; idx < len(mv); idx += 4 {
+		abs := int(int8(mv[idx])) * int(int8(mv[idx]))
+		abs += int(int8(mv[idx+1])) * int(int8(mv[idx+1]))
 		mag += float64(abs)
 	}
 	return math.Log10(mag)
 }
 
 // A goroutine that consumes motion vector data and emits motion events on a channel.
-func ConsumeMotion(motionVector io.Reader, enable *atomic.Value, motion, done chan struct{}) {
+func ConsumeMotion(motionVector io.Reader, motion, done chan struct{}) {
 	defer func() {
 		// If we exit because raspivid died and is no longer producing data, say so.
 		done <- struct{}{}
@@ -88,30 +81,26 @@ func ConsumeMotion(motionVector io.Reader, enable *atomic.Value, motion, done ch
 	// Until we hit EOF
 	for !atEOF {
 		// Read a MotionFrame
-		err := binary.Read(motionVector, binary.BigEndian, frame)
+		_, err := motionVector.Read(frame)
 
 		atEOF = err == io.EOF
 		if err != nil && !atEOF {
-			log.Println(err)
 			return
 		}
 
-		// Only detect motion if the rest of the application is ready for it.
-		if enable.Load() != nil {
-			// If the magnitude is above the threshold.
-			if mag := frame.Mag(); mag > motionThreshold {
-				// If the counter is above the consecutive MotionFrame threshold
-				// and we're ready to record, then emit a motion signal.
-				if counter > consecutiveMotion {
-					log.Println("Motion Detected!")
-					motion <- struct{}{}
-					counter = 0
-				}
-				// Increment the frame counter.
-				counter++
-			} else {
+		// If the magnitude is above the threshold.
+		if mag := frame.Mag(); mag > motionThreshold {
+			// If the counter is above the consecutive MotionFrame threshold
+			// and we're ready to record, then emit a motion signal.
+			if counter > consecutiveMotion {
+				log.Println("Motion Detected!")
+				motion <- struct{}{}
 				counter = 0
 			}
+			// Increment the frame counter.
+			counter++
+		} else {
+			counter = 0
 		}
 	}
 }
@@ -138,8 +127,19 @@ func NewPacketQueue() PacketQueue {
 	}
 }
 
+var startCode = []byte{0x00, 0x00, 0x00, 0x01}
+
+func SplitFrames(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	idx := bytes.Index(data[1:], startCode)
+	if idx == -1 {
+		return 0, nil, nil
+	}
+
+	return idx + 1, data[:idx+1], nil
+}
+
 // Consumes mpeg-ts packets from ffmpeg, stores them in a queue and removes old packets from the queue.
-func ConsumeFFmpeg(r io.Reader, pktQueue *PacketQueue, ready *atomic.Value, record, done chan struct{}) {
+func ConsumeFFmpeg(r io.Reader, pktQueue *PacketQueue, record, done chan struct{}) {
 	defer func() {
 		// If we exit because ffmpeg died and is no longer producing data, say so.
 		done <- struct{}{}
@@ -148,12 +148,17 @@ func ConsumeFFmpeg(r io.Reader, pktQueue *PacketQueue, ready *atomic.Value, reco
 	// Use a pool to re-use packets.
 	pktPool := &sync.Pool{
 		New: func() interface{} {
-			return Packet{Payload: make([]byte, packetLength)}
+			return Packet{}
 		},
 	}
 
 	// Maintain a local queue.
 	local := list.New()
+	var lastNal []byte
+
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	scanner.Split(SplitFrames)
 
 	for {
 		select {
@@ -170,12 +175,26 @@ func ConsumeFFmpeg(r io.Reader, pktQueue *PacketQueue, ready *atomic.Value, reco
 
 		// Get a new packet.
 		pkt := pktPool.Get().(Packet)
+		pkt.Payload = pkt.Payload[:0]
+
 		// Set the timestamp
 		pkt.TimeStamp = time.Now()
+
+		if len(lastNal) != 0 {
+			pkt.Payload = append(pkt.Payload, lastNal...)
+		}
+
 		// Read the packet.
-		if _, err := r.Read(pkt.Payload); err != nil {
-			log.Println("Read ffmpeg:", err)
-			return
+		for scanner.Scan() {
+			nal := scanner.Bytes()
+			log.Printf("NAL: %d % 10d % 10d\n", nal[4]&0x1F, len(pkt.Payload), cap(pkt.Payload))
+
+			if nal[4]&0x1F == 7 && len(pkt.Payload) > 0 {
+				lastNal = nal
+				break
+			}
+
+			pkt.Payload = append(pkt.Payload, nal...)
 		}
 
 		// Put it in the local queue.
@@ -214,25 +233,7 @@ func ConsumeFFmpeg(r io.Reader, pktQueue *PacketQueue, ready *atomic.Value, reco
 			<-pktQueue.lock
 		default:
 		}
-
-		// It can take some time for ffmpeg to start up and begin producing data.
-		// Indicate to anyone waiting on us that we've read our first packet.
-		ready.Store(struct{}{})
 	}
-}
-
-// A Subtitle consists of an index, start and stop time, and a body.
-type Subtitle struct {
-	Index       int
-	Start, Stop time.Time
-	Body        string
-}
-
-// Subtitles are formatted in the SubRip format.
-func (s Subtitle) String() string {
-	times := fmt.Sprintf("%s --> %s", s.Start.Format(srtTimeFmt), s.Stop.Format(srtTimeFmt))
-	times = strings.Replace(times, ".", ",", -1)
-	return fmt.Sprintf("%d\n%s\n{\\a5}%s\n\n", s.Index, times, s.Body)
 }
 
 func init() {
@@ -240,6 +241,15 @@ func init() {
 }
 
 func main() {
+	pprofFile, err := os.Create("pprof.cpu")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pprofFile.Close()
+
+	pprof.StartCPUProfile(pprofFile)
+	defer pprof.StopCPUProfile()
+
 	// Setup signal notification, so we can exit gracefully.
 	sig := make(chan os.Signal)
 	signal.Notify(sig, os.Interrupt, os.Kill)
@@ -247,28 +257,14 @@ func main() {
 	// Specification of raspivid command flags.
 	raspivid := exec.Command(
 		"raspivid", "-w", strconv.Itoa(vw), "-h", strconv.Itoa(vh), "-fps", "30", "-t", "0",
-		"-n", "-g", "10", "-lev", "4.2", "-pf", "high", "-x", motionVectorPipe, "-o", "-",
+		"-n", "-g", "10", "-ih", "-x", motionVectorPipe, "-o", "-",
 	)
 
-	// Specification of ffmpeg command flags.
-	ffmpeg := exec.Command(
-		"ffmpeg", "-f", "h264", "-framerate", "30", "-i", "-", "-vcodec", "copy", "-f", "mpegts", "-",
-	)
-
-	// Route raspivid's stdout to ffmpeg's stdin.
-	ffmpeg.Stdin, _ = raspivid.StdoutPipe()
-
-	// Get a reference to ffmpeg's stdout.
-	out, _ := ffmpeg.StdoutPipe()
-	defer out.Close()
+	raspividStdout, _ := raspivid.StdoutPipe()
+	defer raspividStdout.Close()
 
 	log.Println("Starting: raspivid")
 	if err := raspivid.Start(); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println("Starting: ffmpeg")
-	if err := ffmpeg.Start(); err != nil {
 		log.Fatal(err)
 	}
 
@@ -294,13 +290,9 @@ func main() {
 	after := time.NewTimer(0)
 	after.Stop()
 
-	// Setup ffmpeg's ready signal so we don't do anything until packtes are
-	// being produced.
-	ffmpegReady := new(atomic.Value)
-
 	// Run both of our consumers.
-	go ConsumeMotion(motionVector, ffmpegReady, motion, done)
-	go ConsumeFFmpeg(out, &pktQueue, ffmpegReady, record, done)
+	go ConsumeMotion(motionVector, motion, done)
+	go ConsumeFFmpeg(raspividStdout, &pktQueue, record, done)
 
 	for {
 		select {
@@ -334,69 +326,23 @@ func main() {
 				// Determine our filename base.
 				timeStamp := pkt.TimeStamp.Format(fileTimeFmt)
 
-				// Create the subtitle file, this will hold video timestamps.
-				log.Println("Creating:", timeStamp+".srt")
-				srtFile, err := os.Create(timeStamp + ".srt")
-				if err != nil {
-					log.Fatal(err)
-				}
-
 				// Create the video file.
-				log.Println("Creating:", timeStamp+".ts")
-				videoFile, err := os.Create(timeStamp + ".ts")
+				log.Println("Creating:", timeStamp+".h264")
+				videoFile, err := os.Create(timeStamp + ".h264")
 				if err != nil {
 					log.Fatal(err)
 				}
-
-				var (
-					offset time.Time
-					curr   time.Time
-					next   time.Time
-				)
-				idx := 1
-				division := 100 * time.Millisecond
 
 				// For each packet in the queue.
 				for e := pktQueue.Front(); e != nil; e = e.Next() {
-					// Get the current packet's timestamp.
 					if pkt, ok := e.Value.(Packet); ok {
-						curr = pkt.TimeStamp
-
 						// Write the packet's payload to the video file.
 						_, err := videoFile.Write(pkt.Payload)
 						if err != nil {
 							log.Println(err)
 						}
 					}
-
-					// Get the next packet's timestamp.
-					if e.Next() != nil {
-						if pkt, ok := e.Next().Value.(Packet); ok {
-							next = pkt.TimeStamp
-						}
-					}
-
-					// Produce a subtitle only every "division" length of time.
-					if curr.Truncate(division) != next.Truncate(division) {
-						fmt.Fprint(
-							srtFile,
-							Subtitle{
-								idx,
-								offset,
-								offset.Add(division),
-								curr.Truncate(division).Format(srtDateTimeFmt),
-							},
-						)
-
-						// This will drift, I should probably figure out how far
-						// based on the total length of video an RPi could store
-						// in memory. Or, you know, do it right and keep track
-						// of the timestamp for the last subtitle.
-						offset = offset.Add(division)
-						idx++
-					}
 				}
-				srtFile.Close()
 				videoFile.Close()
 			}
 			// Release the packet queue lock.
