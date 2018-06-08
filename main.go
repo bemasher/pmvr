@@ -6,11 +6,12 @@ import (
 	"container/list"
 	"io"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,20 +21,26 @@ const (
 	vw = 1280
 	vh = 720
 
-	// MPEG-TS packets are all exactly 188 bytes.
-	packetLength = 188
 	// Named pipe raspivid will write motion vectors into and we'll read from.
 	motionVectorPipe = "motion_vectors.fifo"
 
-	// Logarithmic motion threshold for each frame.
-	motionThreshold = 3.5
+	// Vectors with magnitude lower than this threshold are ignored.
+	magnitudeThreshold = 4
+
 	// Number of consecutive frames that exceed the motion threshold before we
-	// trigger recording. Takes care of noise and exposure/whitebalance adjustments.
-	consecutiveMotion = 3
+	// trigger recording. This is primarily used to avoid triggers due to noise
+	// or exposure changes.
+	temporalThreshold = 1
+
+	// Minimum number of vectors above threshold.
+	vectorCountThreshold = 1
+
+	// Threshold below which the SAD for a vector must be in order to be considered reliable.
+	sadThreshold = 1024
 
 	// Number of seconds before and after motion to record.
-	preRecord  = 5 * time.Second
-	postRecord = 5 * time.Second
+	preRecord  = 2500 * time.Millisecond
+	postRecord = 2500 * time.Millisecond
 
 	// Some formatting strings for filenames and timestamp subtitles.
 	srtTimeFmt     = "15:04:05.000"
@@ -44,7 +51,7 @@ const (
 // A motion frame is an array of motion vectors.
 type MotionFrame []byte
 
-// Reterns a new motion frame for the given video width and height.
+// Returns a new motion frame for the given video width and height.
 func NewMotionFrame(w, h int) MotionFrame {
 	// MotionFrames are made up of macroblocks which are 16x16 pixels each.
 	mw := (vw+15)>>4 + 1 // Always one extra column.
@@ -54,14 +61,41 @@ func NewMotionFrame(w, h int) MotionFrame {
 }
 
 // Determine the magnitude of the motion for all of the vectors.
-func (mv MotionFrame) Mag() (mag float64) {
-	mag = 1.0
+func (mv MotionFrame) AboveThreshold() bool {
+	var (
+		min   int
+		count int
+	)
+
+	maxSad := uint16(0) // Smallest uint16 is 0
+	minSad := ^maxSad   // Largest uint16 is 65535
+
 	for idx := 0; idx < len(mv); idx += 4 {
 		abs := int(int8(mv[idx])) * int(int8(mv[idx]))
 		abs += int(int8(mv[idx+1])) * int(int8(mv[idx+1]))
-		mag += float64(abs)
+
+		if abs > min {
+			min = abs
+		}
+
+		sad := uint16(mv[idx+2]) | uint16(mv[idx+3])<<8
+		if sad < sadThreshold && abs > magnitudeThreshold {
+			count++
+
+			if sad < minSad {
+				minSad = sad
+			}
+			if sad > maxSad {
+				maxSad = sad
+			}
+		}
 	}
-	return math.Log10(mag)
+
+	if count > vectorCountThreshold {
+		log.Printf("%6d %6d %6d %6d\n", min, count, minSad, maxSad)
+	}
+
+	return count > vectorCountThreshold
 }
 
 // A goroutine that consumes motion vector data and emits motion events on a channel.
@@ -72,10 +106,15 @@ func ConsumeMotion(motionVector io.Reader, motion, done chan struct{}) {
 	}()
 
 	var (
-		atEOF   bool
-		counter int
-		frame   = NewMotionFrame(vw, vh)
+		atEOF      bool
+		counter    int
+		frame      = NewMotionFrame(vw, vh)
+		startDelay = true
 	)
+
+	time.AfterFunc(time.Second*5, func() {
+		startDelay = false
+	})
 
 	// Until we hit EOF
 	for !atEOF {
@@ -87,11 +126,15 @@ func ConsumeMotion(motionVector io.Reader, motion, done chan struct{}) {
 			return
 		}
 
+		if startDelay {
+			continue
+		}
+
 		// If the magnitude is above the threshold.
-		if mag := frame.Mag(); mag > motionThreshold {
+		if frame.AboveThreshold() {
 			// If the counter is above the consecutive MotionFrame threshold
 			// and we're ready to record, then emit a motion signal.
-			if counter > consecutiveMotion {
+			if counter > temporalThreshold {
 				log.Println("Motion Detected!")
 				motion <- struct{}{}
 				counter = 0
@@ -137,10 +180,10 @@ func SplitFrames(data []byte, atEOF bool) (advance int, token []byte, err error)
 	return idx + 1, data[:idx+1], nil
 }
 
-// Consumes mpeg-ts packets from ffmpeg, stores them in a queue and removes old packets from the queue.
-func ConsumeFFmpeg(r io.Reader, pktQueue *PacketQueue, record, done chan struct{}) {
+// Consumes h.264 packets from raspivid, stores them in a queue and removes old packets from the queue.
+func ConsumeVideo(r io.Reader, pktQueue *PacketQueue, record, done chan struct{}) {
 	defer func() {
-		// If we exit because ffmpeg died and is no longer producing data, say so.
+		// If we exit because raspivid died and is no longer producing data, say so.
 		done <- struct{}{}
 	}()
 
@@ -234,6 +277,24 @@ func ConsumeFFmpeg(r io.Reader, pktQueue *PacketQueue, record, done chan struct{
 	}
 }
 
+func RemuxH264(filename string) {
+	log.Println("Remuxing:", filename)
+
+	ext := filepath.Ext(filename)
+	newFilename := strings.TrimSuffix(filename, ext) + ".mp4"
+
+	mp4box := exec.Command("MP4Box", "-add", filename, "-fps", "30.0", "-new", newFilename)
+	mp4box.Stdout = os.Stdout
+	mp4box.Stderr = os.Stderr
+	err := mp4box.Run()
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	os.Remove(filename)
+}
+
 func init() {
 	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
 }
@@ -246,7 +307,7 @@ func main() {
 	// Specification of raspivid command flags.
 	raspivid := exec.Command(
 		"raspivid", "-w", strconv.Itoa(vw), "-h", strconv.Itoa(vh), "-fps", "30", "-t", "0",
-		"-n", "-g", "10", "-ih", "-x", motionVectorPipe, "-o", "-",
+		"-n", "-g", "10", "-vf", "-ih", "-x", motionVectorPipe, "-o", "-",
 	)
 
 	raspividStdout, _ := raspivid.StdoutPipe()
@@ -281,7 +342,7 @@ func main() {
 
 	// Run both of our consumers.
 	go ConsumeMotion(motionVector, motion, done)
-	go ConsumeFFmpeg(raspividStdout, &pktQueue, record, done)
+	go ConsumeVideo(raspividStdout, &pktQueue, record, done)
 
 	for {
 		select {
@@ -291,7 +352,7 @@ func main() {
 			return
 		case <-done:
 			// If either of our consumers have died, exit.
-			log.Println("Terminating")
+			log.Println("Terminating: consumer died")
 			return
 		case <-motion:
 			// We've received a motion event.
@@ -314,10 +375,11 @@ func main() {
 			if pkt, ok := pktQueue.Front().Value.(Packet); ok {
 				// Determine our filename base.
 				timeStamp := pkt.TimeStamp.Format(fileTimeFmt)
+				filename := timeStamp + ".h264"
 
 				// Create the video file.
-				log.Println("Creating:", timeStamp+".h264")
-				videoFile, err := os.Create(timeStamp + ".h264")
+				log.Println("Creating:", filename)
+				videoFile, err := os.Create(filename)
 				if err != nil {
 					log.Fatal(err)
 				}
@@ -332,7 +394,9 @@ func main() {
 						}
 					}
 				}
+
 				videoFile.Close()
+				go RemuxH264(filename)
 			}
 			// Release the packet queue lock.
 			<-pktQueue.lock
